@@ -596,19 +596,29 @@ class Flange(pypeType):
                 base = base.cut(hole)
                 hole.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), 360.0 / fp.n)
         # creates flange thickness
-        flange = base.extrude(FreeCAD.Vector(0, 0, fp.t)) 
-        fp.ViewObject.Deviation = 0.10
+        flange = base.extrude(FreeCAD.Vector(0, 0, fp.t))
+        # Tessellation quality is a display setting, and ViewObject is None in
+        # console mode. Setting it unguarded raised AttributeError mid-execute,
+        # which recompute swallows -- so every Flange came back with a NULL
+        # shape and no error, headless.
+        if FreeCAD.GuiUp and fp.ViewObject is not None:
+            fp.ViewObject.Deviation = 0.10
         if (
             fp.FlangeType == "SW"
             or fp.FlangeType == "WN"
             or fp.FlangeType == "LJ"
             or fp.FlangeType == "SO"
         ):
-            # creates flange neck (corrected for raised face addition)
-            nn = Part.makeCylinder(fp.ODp / 2, fp.T1, vO, vZ).cut(
-                Part.makeCylinder(fp.d / 2, fp.T1, vO, vZ)
-            )
-            flange = flange.fuse(nn)
+            # creates flange neck (corrected for raised face addition).
+            # Only when it has real dimensions: ODp/T1 are documented OPTIONAL,
+            # and building a zero-radius zero-height cylinder produced a
+            # degenerate solid that fused into an invalid shape rather than
+            # being skipped.
+            if fp.ODp > 0 and fp.T1 > 0 and fp.ODp > fp.d:
+                nn = Part.makeCylinder(fp.ODp / 2, fp.T1, vO, vZ).cut(
+                    Part.makeCylinder(fp.d / 2, fp.T1, vO, vZ)
+                )
+                flange = flange.fuse(nn)
             if fp.trf > 0 and fp.drf < fp.D:
                 rf = Part.makeCylinder(fp.drf / 2, fp.trf, vO, vZ * -1).cut(
                     Part.makeCylinder(fp.d / 2, fp.trf, vO, vZ * -1)
@@ -1039,9 +1049,13 @@ class Tee(pypeType):
                 except Exception as e:
                     # Fillet failed -- fall back to unfilleted shape rather than
                     # crashing the whole recompute
+                    # float() because fillet_r is a Base.Quantity, which has no
+                    # numeric __format__ -- the fallback that exists to avoid
+                    # crashing the recompute was itself raising TypeError and
+                    # taking the Tee down with it.
                     FreeCAD.Console.PrintWarning(
                         "Tee fillet failed (r={:.2f}mm): {} -- using unfilleted shape\n"
-                        .format(fillet_r, e)
+                        .format(float(fillet_r), e)
                     )
 
         fp.Shape = Base
@@ -3958,3 +3972,158 @@ class SocketUnion(pypeType):
             FreeCAD.Vector(0, 0,  1),
         ]
         super(SocketUnion, self).execute(fp)  # perform common operations
+
+
+class Wye(pypeType):
+    """Class for object PType="Wye" -- a swept lateral with a blanked stub.
+
+    Wye(obj,[DN="DN100", OD=114.3, thk=6, H=406.4, BH=250, BA=45, OD2=None, thk2=None])
+      obj: the "App::FeaturePython" object
+      DN (string): nominal diameter
+      OD (float): run outside diameter
+      thk (float): run wall thickness
+      H (float): run length, face to face
+      BH (float): branch length from the run axis to the stub face
+      BA (float): branch angle off the run axis, degrees
+      OD2/thk2 (float): branch outside diameter and wall -- defaults to the run
+
+    Why this exists: Quetzal models a square Tee but has no lateral, and a
+    square branch is the wrong fitting on a solids-bearing line twice over. It
+    leaves a dead leg where fibre and grit settle out, and a rod pushed into it
+    turns a corner instead of running down the pipe. Vendor practice on the job
+    this was written for is explicit -- Scott's quote prohibits T-style branches
+    in writing and LSM's container drawings (02106108) show swept laterals with
+    capped vertical stubs throughout.
+
+    Ports are run inlet, run outlet, then the branch, so a caller can treat
+    ports[0]/ports[1] as the through path exactly as for a Tee.
+    """
+
+    def __init__(self, obj, rating="SCH-STD", DN="DN100", OD=114.3, thk=6.02,
+                 H=406.4, BH=250.0, BA=45.0, OD2=None, thk2=None):
+        super(Wye, self).__init__(obj)
+        obj.PType = "Wye"
+        obj.Proxy = self
+        obj.PRating = rating
+        obj.PSize = DN
+        for name, val, tip in (
+            ("OD", OD, "Run outside diameter"),
+            ("thk", thk, "Run wall thickness"),
+            ("H", H, "Run length, face to face"),
+            ("BH", BH, "Branch length from run axis to stub face"),
+            ("OD2", OD2 if OD2 else OD, "Branch outside diameter"),
+            ("thk2", thk2 if thk2 else thk, "Branch wall thickness"),
+        ):
+            obj.addProperty("App::PropertyLength", name, "Wye",
+                            QT_TRANSLATE_NOOP("App::Property", tip)).setPropertyStatus  # noqa: B018
+            setattr(obj, name, val)
+        obj.addProperty("App::PropertyAngle", "BA", "Wye",
+                        QT_TRANSLATE_NOOP("App::Property", "Branch angle off the run")).BA = BA
+        obj.addProperty("App::PropertyString", "Profile", "Wye",
+                        QT_TRANSLATE_NOOP("App::Property", "Section dim.")).Profile = (
+                            str(obj.OD) + "x" + str(obj.thk))
+        self.execute(obj)
+
+    def onChanged(self, fp, prop):
+        return None
+
+    def execute(self, fp):
+        import math
+
+        od, thk = float(fp.OD), float(fp.thk)
+        od2, thk2 = float(fp.OD2), float(fp.thk2)
+        H, BH = float(fp.H), float(fp.BH)
+        ang = math.radians(float(fp.BA))
+        vO = FreeCAD.Vector(0, 0, 0)
+
+        run_o = Part.makeCylinder(od / 2, H, vO, FreeCAD.Vector(0, 0, 1))
+        run_i = Part.makeCylinder(od / 2 - thk, H, vO, FreeCAD.Vector(0, 0, 1))
+
+        # Branch leaves the run at BA, from the mid-length of the run.
+        bdir = FreeCAD.Vector(math.sin(ang), 0, math.cos(ang))
+        base = FreeCAD.Vector(0, 0, H / 2.0)
+        # Start the branch inside the run so the fuse is watertight.
+        start = base - bdir * (od / 2.0)
+        length = BH + od / 2.0
+        br_o = Part.makeCylinder(od2 / 2, length, start, bdir)
+        br_i = Part.makeCylinder(od2 / 2 - thk2, length, start, bdir)
+
+        solid = run_o.fuse(br_o).removeSplitter()
+        bore = run_i.fuse(br_i)
+        shape = solid.cut(bore)
+
+        fp.Shape = shape
+        tip = base + bdir * BH
+        fp.Ports = [FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, H), tip]
+        fp.PortDirections = [FreeCAD.Vector(0, 0, -1), FreeCAD.Vector(0, 0, 1), bdir]
+        super(Wye, self).execute(fp)
+
+
+class FlexConnector(pypeType):
+    """Class for object PType="FlexConnector" -- a convoluted bellows spool.
+
+    FlexConnector(obj,[DN="DN100", OD=114.3, thk=6, H=150, nConv=6, ampl=None])
+      obj: the "App::FeaturePython" object
+      OD (float): connector outside diameter at the convolution roots
+      thk (float): wall thickness
+      H (float): overall face-to-face length
+      nConv (int): number of convolutions
+      ampl (float): convolution crest height above OD/2
+
+    Quetzal has no flexible element. Modelling one as a plain tube hides the
+    thing that matters about it -- a bellows is the one component on the line
+    that is meant to move, so it needs to read as flexible on the drawing and
+    it needs a body that a clearance envelope can be hung off.
+    """
+
+    def __init__(self, obj, rating="SCH-STD", DN="DN100", OD=114.3, thk=6.02,
+                 H=150.0, nConv=6, ampl=None):
+        super(FlexConnector, self).__init__(obj)
+        obj.PType = "FlexConnector"
+        obj.Proxy = self
+        obj.PRating = rating
+        obj.PSize = DN
+        for name, val, tip in (
+            ("OD", OD, "Outside diameter at convolution roots"),
+            ("thk", thk, "Wall thickness"),
+            ("H", H, "Face-to-face length"),
+            ("ampl", ampl if ampl else OD * 0.10, "Convolution crest height"),
+        ):
+            obj.addProperty("App::PropertyLength", name, "FlexConnector",
+                            QT_TRANSLATE_NOOP("App::Property", tip))
+            setattr(obj, name, val)
+        obj.addProperty("App::PropertyInteger", "nConv", "FlexConnector",
+                        QT_TRANSLATE_NOOP("App::Property", "Number of convolutions")).nConv = nConv
+        obj.addProperty("App::PropertyString", "Profile", "FlexConnector",
+                        QT_TRANSLATE_NOOP("App::Property", "Section dim.")).Profile = (
+                            str(obj.OD) + "x" + str(obj.thk))
+        self.execute(obj)
+
+    def onChanged(self, fp, prop):
+        return None
+
+    def execute(self, fp):
+        od, thk, H = float(fp.OD), float(fp.thk), float(fp.H)
+        ampl = float(fp.ampl)
+        n = max(1, int(fp.nConv))
+        vZ = FreeCAD.Vector(0, 0, 1)
+        vO = FreeCAD.Vector(0, 0, 0)
+
+        # Plain cuffs at each end, convolutions between them.
+        cuff = min(H * 0.15, od * 0.25)
+        body = Part.makeCylinder(od / 2, H, vO, vZ)
+        span = H - 2 * cuff
+        if span > 0 and n > 0:
+            pitch = span / n
+            for i in range(n):
+                z = cuff + pitch * (i + 0.5)
+                body = body.fuse(
+                    Part.makeTorus(od / 2 + ampl / 2, ampl / 2 + pitch * 0.10,
+                                   FreeCAD.Vector(0, 0, z), vZ))
+        body = body.removeSplitter()
+        shape = body.cut(Part.makeCylinder(od / 2 - thk, H, vO, vZ))
+
+        fp.Shape = shape
+        fp.Ports = [vO, FreeCAD.Vector(0, 0, H)]
+        fp.PortDirections = [FreeCAD.Vector(0, 0, -1), vZ]
+        super(FlexConnector, self).execute(fp)
