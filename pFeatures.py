@@ -4049,6 +4049,38 @@ class Wye(pypeType):
         br_i = Part.makeCylinder(od2 / 2 - thk2, length, start, bdir)
 
         solid = run_o.fuse(br_o).removeSplitter()
+
+        # Fillet the crotch. Without it a lateral is two tubes meeting at an
+        # angle -- which is what it looks like, and a reviewer reads it as a
+        # placeholder. A real Y-lateral has a swept crotch, and it is not
+        # cosmetic on a solids line: the sharp internal corner is where fibre
+        # catches. Tee does the same thing a few hundred lines up.
+        crotch = min(float(thk) * 1.5, od * 0.15)
+        if crotch > 0.1:
+            tol = 0.5
+            edges = []
+            for edge in solid.Edges:
+                try:
+                    mid = edge.valueAt(
+                        (edge.FirstParameter + edge.LastParameter) / 2.0)
+                    d_run = math.sqrt(mid.x ** 2 + mid.y ** 2)
+                    rel = FreeCAD.Vector(mid.x - base.x, mid.y - base.y,
+                                         mid.z - base.z)
+                    along = rel.dot(bdir)
+                    d_br = (rel - bdir * along).Length
+                    if (abs(d_run - od / 2.0) < tol
+                            and abs(d_br - od2 / 2.0) < tol):
+                        edges.append(edge)
+                except Exception:
+                    continue
+            if edges:
+                try:
+                    solid = solid.makeFillet(crotch, edges)
+                except Exception as e:
+                    FreeCAD.Console.PrintWarning(
+                        "Wye crotch fillet failed (r={:.2f}mm): {} -- using "
+                        "unfilleted shape\n".format(float(crotch), e))
+
         bore = run_i.fuse(br_i)
         shape = solid.cut(bore)
 
